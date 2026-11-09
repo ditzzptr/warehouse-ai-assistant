@@ -1,9 +1,0 @@
-fastapi
-uvicorn[standard]
-streamlit
-pandas
-sqlalchemy
-psycopg[binary]
-requests
-plotly
-pydantic
