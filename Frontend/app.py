@@ -1,4 +1,4 @@
-﻿import json
+import json
 import os
 import sys
 from pathlib import Path
@@ -23,6 +23,21 @@ except Exception:
 
 from backend import services  # noqa: E402
 from backend.services import ServiceError  # noqa: E402
+
+def _secret(name, default=""):
+    """Baca dari Streamlit Secrets, lalu environment variable."""
+    try:
+        if name in st.secrets:
+            return str(st.secrets[name])
+    except Exception:
+        pass
+    return os.getenv(name, default)
+
+
+# AI online (Groq). Jika GROQ_API_KEY diisi, chat memakai Groq; jika tidak, memakai Ollama lokal.
+GROQ_API_KEY = _secret("GROQ_API_KEY")
+GROQ_MODEL = _secret("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_URL = f"{OLLAMA_BASE_URL.rstrip('/')}/api/chat"
@@ -334,8 +349,12 @@ if question:
     with st.chat_message("user"):
         st.markdown(question)
 
-    inventory_context = pd.DataFrame(items).to_json(orient="records")
-    
+    # Kirim kolom yang penting saja dan batasi panjangnya agar tidak melewati batas token API gratis
+    inventory_context = pd.DataFrame(
+        items,
+        columns=["sku", "name", "category", "quantity", "unit", "min_stock", "unit_price", "status"],
+    ).to_json(orient="records", force_ascii=False)[:6000]
+
     system_prompt = """
     Kamu adalah Warehouse AI Assistant.
 
@@ -383,57 +402,100 @@ if question:
         answer = ""
         response_placeholder = st.empty()
 
+        use_groq = bool(GROQ_API_KEY)
+        provider = "Groq" if use_groq else "Ollama"
+
         try:
-            payload = {
-                "model": MODEL_NAME,
-                "messages": messages,
-                "stream": True,
-                "keep_alive": "10m",
-                "options": {
+            if use_groq:
+                # --- AI online lewat Groq (format OpenAI-compatible, streaming SSE) ---
+                payload = {
+                    "model": GROQ_MODEL,
+                    "messages": messages,
+                    "stream": True,
                     "temperature": 0.2,
-                    "num_predict": 200,
-                    "num_ctx": 4096
+                    "max_tokens": 800,
                 }
-            }
-            with requests.post(
-                OLLAMA_URL,
-                json=payload,
-                stream=True,
-                timeout=(10, 300),
-            ) as response:
+                headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+                with requests.post(
+                    GROQ_URL, json=payload, headers=headers,
+                    stream=True, timeout=(10, 120),
+                ) as response:
+                    response.raise_for_status()
+                    for raw in response.iter_lines(decode_unicode=True):
+                        if not raw or not raw.startswith("data:"):
+                            continue
+                        chunk = raw[len("data:"):].strip()
+                        if chunk == "[DONE]":
+                            break
+                        data = json.loads(chunk)
+                        choices = data.get("choices") or []
+                        content = (choices[0].get("delta") or {}).get("content") if choices else None
+                        if content:
+                            answer += content
+                            response_placeholder.markdown(answer + "▌")
+            else:
+                # --- AI lokal lewat Ollama (hanya jalan di komputer yang menjalankan Ollama) ---
+                payload = {
+                    "model": MODEL_NAME,
+                    "messages": messages,
+                    "stream": True,
+                    "keep_alive": "10m",
+                    "options": {
+                        "temperature": 0.2,
+                        "num_predict": 200,
+                        "num_ctx": 4096
+                    }
+                }
+                with requests.post(
+                    OLLAMA_URL,
+                    json=payload,
+                    stream=True,
+                    timeout=(10, 300),
+                ) as response:
 
-                response.raise_for_status()
+                    response.raise_for_status()
 
-                for line in response.iter_lines():
-                    if not line:
-                        continue
+                    for line in response.iter_lines():
+                        if not line:
+                            continue
 
-                    data = json.loads(line)
-                    print("THINKING:", data.get("message", {}).get("thinking", ""))
-                    print("CONTENT:", data.get("message", {}).get("content", ""))
+                        data = json.loads(line)
+                        content = data.get("message", {}).get("content", "")
 
-                    # Ambil teks jawaban dari Ollama
-                    content = data.get("message", {}).get("content", "")
+                        if content:
+                            answer += content
+                            response_placeholder.markdown(answer + "▌")
 
-                    if content:
-                        answer += content
-                        response_placeholder.markdown(answer + "▌")
+                        # Berhenti jika proses sudah selesai
+                        if data.get("done", False):
+                            break
 
-                    # Berhenti jika proses sudah selesai
-                    if data.get("done", False):
-                        break
+            if not answer.strip():
+                answer = "AI tidak mengembalikan jawaban. Coba ulangi pertanyaan Anda."
+
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status == 401:
+                answer = "API key tidak valid. Periksa GROQ_API_KEY di Settings → Secrets."
+            elif status == 429:
+                answer = "Batas pemakaian gratis AI tercapai. Tunggu beberapa saat lalu coba lagi."
+            else:
+                answer = f"AI ({provider}) mengembalikan error: {e}"
 
         except requests.exceptions.Timeout:
-            answer = "Waktu tunggu habis. Coba gunakan model yang lebih ringan."
+            answer = "Waktu tunggu habis. Coba lagi sebentar lagi."
 
         except requests.exceptions.ConnectionError:
-            answer = (
-                "Tidak dapat terhubung ke Ollama. "
-                "Pastikan container warehouse-ollama sedang berjalan."
-            )
+            if use_groq:
+                answer = "Tidak dapat terhubung ke Groq. Periksa koneksi internet server."
+            else:
+                answer = (
+                    "Tidak dapat terhubung ke Ollama. Di Streamlit Cloud, isi GROQ_API_KEY "
+                    "di Settings → Secrets agar AI berjalan online."
+                )
 
         except requests.exceptions.RequestException as e:
-            answer = f"Terjadi kesalahan saat menghubungi Ollama: {e}"
+            answer = f"Terjadi kesalahan saat menghubungi {provider}: {e}"
 
         except Exception as e:
             answer = f"Terjadi kesalahan: {e}"
