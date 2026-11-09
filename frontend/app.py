@@ -5,7 +5,7 @@ import plotly.express as px
 import streamlit as st
 import json
 
-API_URL = "http://127.0.0.1:8000"
+API_URL = "https://9a85130e6014d9f7-160-22-134-41.serveousercontent.com"
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_URL = f"{OLLAMA_BASE_URL.rstrip('/')}/api/chat"
 MODEL_NAME = os.getenv("OLLAMA_MODEL", "qwen3:4b-instruct")
